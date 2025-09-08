@@ -10,7 +10,7 @@ import {
   LANE_WIDTH_PX,
   MAX_SPEED_MPS,
   MAX_VEHICLES,
-  // MIN_SPEED_MPS, // MIN_SPEED_MPS should be 0 for realistic stops
+  MIN_SPEED_MPS,
   MOTO_LENGTH_M,
   PIXELS_PER_METER,
   ROAD_WIDTH,
@@ -25,9 +25,6 @@ import {
   VEHICLE_HISTORY_MAX_LENGTH,
   DEBUG_MODE,
 } from "../constants.js";
-
-// Ensure MIN_SPEED_MPS is 0 for realistic stopping behavior
-const MIN_SPEED_MPS = 0; // Temporarily overriding here if not changed in constants.js
 
 // Vehicle object pool
 const vehiclePool = [];
