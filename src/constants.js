@@ -31,7 +31,7 @@ export const STOP_LINE_BUFFER = 5 * PIXELS_PER_METER;
 // Simulation Parameters
 export const APPROACH_THRESHOLD = 2 * PIXELS_PER_METER;
 export const MAX_VEHICLES = 50;
-export const MIN_SPEED_MPS = 0.1;
+export const MIN_SPEED_MPS = 0;
 
 // Speed Limits
 export const MAX_SPEED_KPH = 50;

@@ -10,7 +10,7 @@ import {
   LANE_WIDTH_PX,
   MAX_SPEED_MPS,
   MAX_VEHICLES,
-  MIN_SPEED_MPS,
+  // MIN_SPEED_MPS, // MIN_SPEED_MPS should be 0 for realistic stops
   MOTO_LENGTH_M,
   PIXELS_PER_METER,
   ROAD_WIDTH,
@@ -25,6 +25,9 @@ import {
   VEHICLE_HISTORY_MAX_LENGTH,
   DEBUG_MODE,
 } from "../constants.js";
+
+// Ensure MIN_SPEED_MPS is 0 for realistic stopping behavior
+const MIN_SPEED_MPS = 0; // Temporarily overriding here if not changed in constants.js
 
 // Vehicle object pool
 const vehiclePool = [];
@@ -424,15 +427,17 @@ function updateVehicles(state, deltaTime) {
       validateVehicle(v);
       let vehicle = { ...v };
 
+      // Check if vehicle has reached the end of its path
       if (vehicle.pathIndex >= vehicle.path.length) {
         state.stats.completedTrips.push({
           id: vehicle.id,
           waitTime: vehicle.waitTime,
         });
         returnVehicleToPool(vehicle);
-        continue;
+        continue; // Skip this vehicle, it has completed its journey
       }
 
+      // Update vehicle's target point and angle based on path
       if (vehicle.pathIndex < vehicle.path.length) {
         const targetPoint = vehicle.path[vehicle.pathIndex];
         const dx = targetPoint.x - vehicle.x;
@@ -443,22 +448,23 @@ function updateVehicles(state, deltaTime) {
         if (distanceToTarget < APPROACH_THRESHOLD) {
           vehicle.pathIndex++;
         }
-
-        if (vehicle.pathIndex < vehicle.path.length) {
-          const distanceToMove_px =
-            vehicle.speed_mps * PIXELS_PER_METER * deltaTime;
-          vehicle.x += Math.cos(vehicle.angle) * distanceToMove_px;
-          vehicle.y += Math.sin(vehicle.angle) * distanceToMove_px;
-        }
       }
+      // If the vehicle has a valid next path point after pathIndex increment,
+      // it will continue to move towards it. If pathIndex is now out of bounds,
+      // the vehicle will naturally slow down or stop unless new path is added.
 
+      // Find leader for IDM
       const { leader, distanceToLeader_px } = findLeader(vehicle);
       let acceleration = calculateIDMAcceleration(
         vehicle,
         leader,
         distanceToLeader_px,
       );
+
+      // Handle intersection and traffic light logic, which might override acceleration
       acceleration = handleIntersectionAndLights(vehicle, acceleration, state);
+
+      // Update vehicle physics based on calculated acceleration
       updatePhysics(
         vehicle,
         acceleration,
@@ -469,7 +475,7 @@ function updateVehicles(state, deltaTime) {
       newVehicles.push(vehicle);
     } catch (error) {
       console.error("Error updating vehicle:", error, v);
-      // Skip invalid vehicle instead of crashing
+      // Skip invalid vehicle instead of crashing the simulation
     }
   }
 
@@ -488,25 +494,32 @@ function findLeader(currentVehicle) {
   const nearbyVehicles = getNearbyVehicles(currentVehicle);
 
   for (const other of nearbyVehicles) {
-    const dist_px = Math.sqrt(
-      Math.pow(currentVehicle.x - other.x, 2) +
-        Math.pow(currentVehicle.y - other.y, 2),
-    );
+    // Only consider vehicles going in roughly the same direction
     const angleToOther = Math.atan2(
       other.y - currentVehicle.y,
       other.x - currentVehicle.x,
     );
-
     const angleDiff = Math.abs(currentVehicle.angle - angleToOther);
     const normalizedAngleDiff =
       ((angleDiff + Math.PI) % (2 * Math.PI)) - Math.PI;
 
-    if (
-      Math.abs(normalizedAngleDiff) < Math.PI / 6 &&
-      dist_px < distanceToLeader_px
-    ) {
-      distanceToLeader_px = dist_px;
-      leader = other;
+    if (Math.abs(normalizedAngleDiff) < Math.PI / 6) {
+      // Check if 'other' is actually ahead of 'currentVehicle'
+      // Project 'other' onto 'currentVehicle's path
+      const dotProduct =
+        (other.x - currentVehicle.x) * Math.cos(currentVehicle.angle) +
+        (other.y - currentVehicle.y) * Math.sin(currentVehicle.angle);
+
+      if (dotProduct > 0) {
+        const dist_px = Math.sqrt(
+          Math.pow(currentVehicle.x - other.x, 2) +
+            Math.pow(currentVehicle.y - other.y, 2),
+        );
+        if (dist_px < distanceToLeader_px) {
+          distanceToLeader_px = dist_px;
+          leader = other;
+        }
+      }
     }
   }
 
@@ -530,190 +543,121 @@ function calculateIDMAcceleration(vehicle, leader, distanceToLeader_px) {
     const delta_v = v - leader.speed_mps;
     const desiredGap =
       s0 + Math.max(0, v * T + (v * delta_v) / (2 * Math.sqrt(a * b)));
-    interactionTerm = a * Math.pow(desiredGap / s, 2);
+    // Avoid division by zero or negative s
+    if (s > 0) {
+      interactionTerm = a * Math.pow(desiredGap / s, 2);
+    } else {
+      // If s is zero or negative, vehicles are overlapping or too close,
+      // apply strong braking to resolve
+      interactionTerm = a * Math.pow(desiredGap / 0.01, 2); // Use a small positive number
+    }
   }
 
   return freeRoadTerm - interactionTerm;
 }
 
-function getExitQueueInfo(exitApproach, vehicles) {
-  let frontVehicleInQueue = null;
-  let minDistance = Infinity;
-  const W = SIMULATION_WIDTH;
-  const H = SIMULATION_HEIGHT;
+// Helper to check if a vehicle is within the general intersection bounds
+function isInIntersection(x, y, W, H, R) {
+  const margin = ROAD_WIDTH * INTERSECTION_MARGIN_RATIO;
+  const intersectionMinX = W / 2 - R - margin;
+  const intersectionMaxX = W / 2 + R + margin;
+  const intersectionMinY = H / 2 - R - margin;
+  const intersectionMaxY = H / 2 + R + margin;
 
-  for (const v of vehicles) {
-    if (v.approach === exitApproach && v.status === "waiting") {
-      const dist = Math.sqrt(
-        Math.pow(v.x - W / 2, 2) + Math.pow(v.y - H / 2, 2),
-      );
-      if (dist < minDistance) {
-        minDistance = dist;
-        frontVehicleInQueue = v;
-      }
-    }
-  }
-
-  return { frontVehicleInQueue };
+  return (
+    x > intersectionMinX &&
+    x < intersectionMaxX &&
+    y > intersectionMinY &&
+    y < intersectionMaxY
+  );
 }
 
 function handleIntersectionAndLights(vehicle, currentAcceleration, state) {
-  const { trafficLights, vehicles } = state;
+  const { trafficLights } = state;
   const H = SIMULATION_HEIGHT;
   const R = ROAD_WIDTH / 2;
   const W = SIMULATION_WIDTH;
 
-  const stopLineY = H / 2 - R;
-
   let distanceToStopLine_px = Infinity;
-  let isApproaching = false;
 
+  // Calculate distance to stop line based on vehicle's approach
   switch (vehicle.approach) {
-    case "north":
-      distanceToStopLine_px = stopLineY - vehicle.y;
-      isApproaching =
-        distanceToStopLine_px < 100 * PIXELS_PER_METER &&
-        distanceToStopLine_px > -CAR_LENGTH;
+    case "north": // Approaching from top, stop line at H/2 - R
+      distanceToStopLine_px = H / 2 - R - vehicle.y;
       break;
-    case "south":
+    case "south": // Approaching from bottom, stop line at H/2 + R
       distanceToStopLine_px = vehicle.y - (H / 2 + R);
-      isApproaching =
-        distanceToStopLine_px < 100 * PIXELS_PER_METER &&
-        distanceToStopLine_px > -CAR_LENGTH;
       break;
-    case "east":
+    case "east": // Approaching from right, stop line at W/2 + R
       distanceToStopLine_px = vehicle.x - (W / 2 + R);
-      isApproaching =
-        distanceToStopLine_px < 100 * PIXELS_PER_METER &&
-        distanceToStopLine_px > -CAR_LENGTH;
       break;
-    case "west":
+    case "west": // Approaching from left, stop line at W/2 - R
       distanceToStopLine_px = W / 2 - R - vehicle.x;
-      isApproaching =
-        distanceToStopLine_px < 100 * PIXELS_PER_METER &&
-        distanceToStopLine_px > -CAR_LENGTH;
       break;
   }
 
-  const isInIntersection = (x, y, approach) => {
-    const intersectionMargin = ROAD_WIDTH * INTERSECTION_MARGIN_RATIO;
+  // Define the zone where traffic light rules are actively applied.
+  // This zone extends from a reasonable distance before the stop line to slightly past it.
+  const LIGHT_INTERACTION_ZONE_START_PX = 100 * PIXELS_PER_METER; // e.g., 100 meters before the stop line
+  const LIGHT_INTERACTION_ZONE_END_PX = CAR_LENGTH_M * PIXELS_PER_METER; // e.g., CAR_LENGTH meters past the stop line
 
-    switch (approach) {
-      case "north":
-        return (
-          y > H / 2 - R - intersectionMargin &&
-          y < H / 2 + R + intersectionMargin &&
-          x > W / 2 - R &&
-          x < W / 2 + R
-        );
-      case "south":
-        return (
-          y > H / 2 - R &&
-          y < H / 2 + R + intersectionMargin &&
-          x > W / 2 - R &&
-          x < W / 2 + R
-        );
-      case "east":
-        return (
-          x > W / 2 - R - intersectionMargin &&
-          x < W / 2 + R + intersectionMargin &&
-          y > H / 2 - R &&
-          y < H / 2 + R
-        );
-      case "west":
-        return (
-          x > W / 2 - R &&
-          x < W / 2 + R + intersectionMargin &&
-          y > H / 2 - R &&
-          y < H / 2 + R
-        );
-      default:
-        return Math.abs(x - W / 2) < R && Math.abs(y - H / 2) < R;
-    }
-  };
+  const atStopLineOrJustPast =
+    distanceToStopLine_px < LIGHT_INTERACTION_ZONE_START_PX &&
+    distanceToStopLine_px > -LIGHT_INTERACTION_ZONE_END_PX;
 
-  if (isInIntersection(vehicle.x, vehicle.y, vehicle.approach)) {
-    if (
-      vehicle.destination !== "straight" &&
-      vehicle.speed_mps > TURN_SPEED_LIMIT_MPS
-    ) {
-      return -vehicle.braking_mps2;
-    }
-    return currentAcceleration;
-  }
+  const light = trafficLights[vehicle.approach];
+  let virtualLeader = null;
 
-  if (isApproaching) {
-    const light = trafficLights[vehicle.approach];
-    let virtualLeader = null;
-
+  // Logic for stopping at red/yellow lights
+  if (atStopLineOrJustPast) {
     const shouldStopForRed = () => {
       if (light === "red") {
         return true;
       }
-
       if (light === "yellow") {
-        const stoppingDistance =
+        const stoppingDistance_m =
           vehicle.speed_mps ** 2 / (2 * vehicle.braking_mps2);
+        const distanceToStopLine_m = distanceToStopLine_px / PIXELS_PER_METER;
 
+        // If stopping distance is greater than actual distance to stop line, or if very close, stop.
+        // Aggression threshold allows some vehicles to run yellow if they can't stop safely.
         return (
-          stoppingDistance > distanceToStopLine_px / PIXELS_PER_METER &&
+          (stoppingDistance_m > distanceToStopLine_m ||
+            distanceToStopLine_m < CAR_LENGTH_M / 2) && // If too close to stop line, even aggressive drivers stop
           vehicle.aggression < 0.8
         );
       }
-
       return false;
     };
 
     if (shouldStopForRed()) {
+      // Create a virtual leader at the stop line to force the vehicle to stop
       virtualLeader = { speed_mps: 0 };
-    } else if (light === "green") {
-      if (vehicle.destination === "straight") {
-        const exitApproaches = {
-          north: "south",
-          south: "north",
-          east: "west",
-          west: "east",
-        };
-        const exitApproach = exitApproaches[vehicle.approach];
-        const { frontVehicleInQueue } = getExitQueueInfo(
-          exitApproach,
-          vehicles,
-        );
-
-        if (frontVehicleInQueue) {
-          let availableGap_px = 0;
-          if (exitApproach === "north")
-            availableGap_px = frontVehicleInQueue.y - (H / 2 + R);
-          if (exitApproach === "south")
-            availableGap_px = H / 2 - R - frontVehicleInQueue.y;
-          if (exitApproach === "east")
-            availableGap_px = frontVehicleInQueue.x - (W / 2 + R);
-          if (exitApproach === "west")
-            availableGap_px = W / 2 - R - frontVehicleInQueue.x;
-
-          const vehicleLength_px =
-            (vehicle.type === "motorcycle" ? MOTO_LENGTH_M : CAR_LENGTH_M) *
-            PIXELS_PER_METER;
-
-          if (
-            availableGap_px <
-            vehicleLength_px + IDM_MIN_SPACING_M * PIXELS_PER_METER
-          ) {
-            virtualLeader = { speed_mps: 0 };
-          }
-        }
-      }
     }
+    // Removed: The 'else if (light === "green")' block that handled exit queue for straight vehicles.
+    // This was causing vehicles to get stuck on green unnecessarily.
+    // Downstream congestion should be handled by the IDM's findLeader function.
+  }
 
-    if (virtualLeader) {
-      const stopDistance = Math.max(
-        0,
-        distanceToStopLine_px - STOP_LINE_BUFFER,
-      );
-      return calculateIDMAcceleration(vehicle, virtualLeader, stopDistance);
+  // Apply the virtual leader's effect if one was created (from red/yellow light logic)
+  if (virtualLeader) {
+    const stopDistance = Math.max(0, distanceToStopLine_px - STOP_LINE_BUFFER);
+    return calculateIDMAcceleration(vehicle, virtualLeader, stopDistance);
+  }
+
+  // If no virtual leader (i.e., green light or not in interaction zone),
+  // apply intersection-specific behaviors like turn speed limits.
+  // This happens *after* any stop-light decisions.
+  if (isInIntersection(vehicle.x, vehicle.y, W, H, R)) {
+    if (
+      vehicle.destination !== "straight" &&
+      vehicle.speed_mps > TURN_SPEED_LIMIT_MPS
+    ) {
+      return -vehicle.braking_mps2; // Force braking for turns
     }
   }
 
+  // No specific light or intersection override, return the acceleration calculated by IDM with physical leaders.
   return currentAcceleration;
 }
 
@@ -726,11 +670,13 @@ function updatePhysics(
 ) {
   vehicle.speed_mps += acceleration * deltaTime;
 
+  // Clamp speed to valid range (MIN_SPEED_MPS is now 0)
   vehicle.speed_mps = Math.max(
-    MIN_SPEED_MPS,
+    MIN_SPEED_MPS, // Allows full stop
     Math.min(vehicle.speed_mps, vehicle.maxSpeed_mps),
   );
 
+  // If very close to a leader, ensure speed doesn't exceed leader's speed
   if (
     leader &&
     distanceToLeader_px <
@@ -741,15 +687,17 @@ function updatePhysics(
 
   const distanceToMove_px = vehicle.speed_mps * PIXELS_PER_METER * deltaTime;
 
+  // Only move if speed is above the minimum threshold (which is 0 now, so it will move even slowly)
+  // The check for MIN_SPEED_MPS is still good practice to avoid floating point inaccuracies for "stopped" cars
   if (vehicle.speed_mps > MIN_SPEED_MPS) {
     vehicle.x += Math.cos(vehicle.angle) * distanceToMove_px;
     vehicle.y += Math.sin(vehicle.angle) * distanceToMove_px;
   }
 
   vehicle.status =
-    vehicle.speed_mps < MIN_SPEED_MPS + 0.1 ? "waiting" : "moving";
+    vehicle.speed_mps < MIN_SPEED_MPS + 0.05 ? "waiting" : "moving"; // Added small buffer for "waiting" check
   if (vehicle.status === "waiting") vehicle.waitTime += deltaTime;
-  vehicle.isBraking = acceleration < -0.5;
+  vehicle.isBraking = acceleration < -0.5; // Threshold for displaying braking
 }
 
 function spawnVehicles(state) {
@@ -827,6 +775,8 @@ function spawnVehicles(state) {
     );
 
     if (allowedLanes.length === 0) {
+      // Fallback if no specific lane allows the destination, pick any lane.
+      // This could happen if a destination is restricted for an approach.
       allowedLanes.push(startApproach.lanes[0]);
     }
 
@@ -880,55 +830,55 @@ function generateSmoothPath(approach, destination, lane, startX, startY) {
 
   // Simple linear paths for now - could be enhanced with Bezier curves
   switch (approach) {
-    case "north":
+    case "north": // From top to bottom
       if (destination === "straight") return [{ x: startX, y: H + CAR_LENGTH }];
       if (destination === "left")
         return [
-          { x: W / 2 - L2, y: H / 2 + L1 },
+          { x: W / 2 - L2, y: H / 2 + L1 }, // Turn left towards east-bound lane (south side)
           { x: W + CAR_LENGTH, y: H / 2 + L1 },
         ];
       if (destination === "right")
         return [
-          { x: W / 2 - L1, y: H / 2 - L2 },
+          { x: W / 2 - L1, y: H / 2 - L2 }, // Turn right towards west-bound lane (north side)
           { x: -CAR_LENGTH, y: H / 2 - L2 },
         ];
       break;
-    case "south":
+    case "south": // From bottom to top
       if (destination === "straight") return [{ x: startX, y: -CAR_LENGTH }];
       if (destination === "left")
         return [
-          { x: W / 2 + L2, y: H / 2 - L1 },
+          { x: W / 2 + L2, y: H / 2 - L1 }, // Turn left towards west-bound lane (north side)
           { x: -CAR_LENGTH, y: H / 2 - L1 },
         ];
       if (destination === "right")
         return [
-          { x: W / 2 + L1, y: H / 2 + L2 },
+          { x: W / 2 + L1, y: H / 2 + L2 }, // Turn right towards east-bound lane (south side)
           { x: W + CAR_LENGTH, y: H / 2 + L2 },
         ];
       break;
-    case "east":
+    case "east": // From right to left
       if (destination === "straight") return [{ x: -CAR_LENGTH, y: startY }];
       if (destination === "left")
         return [
-          { x: W / 2 - L1, y: H / 2 - L2 },
+          { x: W / 2 - L1, y: H / 2 - L2 }, // Turn left towards north-bound lane (east side)
           { x: W / 2 - L1, y: H + CAR_LENGTH },
         ];
       if (destination === "right")
         return [
-          { x: W / 2 + L2, y: H / 2 - L1 },
+          { x: W / 2 + L2, y: H / 2 - L1 }, // Turn right towards south-bound lane (east side)
           { x: W / 2 + L2, y: -CAR_LENGTH },
         ];
       break;
-    case "west":
+    case "west": // From left to right
       if (destination === "straight") return [{ x: W + CAR_LENGTH, y: startY }];
       if (destination === "left")
         return [
-          { x: W / 2 + L2, y: H / 2 + L1 },
+          { x: W / 2 + L2, y: H / 2 + L1 }, // Turn left towards south-bound lane (west side)
           { x: W / 2 + L2, y: -CAR_LENGTH },
         ];
       if (destination === "right")
         return [
-          { x: W / 2 - L1, y: H / 2 + L2 },
+          { x: W / 2 - L1, y: H / 2 + L2 }, // Turn right towards north-bound lane (west side)
           { x: W / 2 - L1, y: H + CAR_LENGTH },
         ];
       break;
